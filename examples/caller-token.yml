@@ -1,0 +1,19 @@
+# Copy to .github/workflows/release.yml in your app's repository.
+# Releases the app when a version tag is pushed, with a release token from the portal
+# (Settings, Developer, Release tokens) stored as the repository secret ROBUTLER_RELEASE_TOKEN.
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    permissions:
+      contents: read
+    uses: robutlerai/app-ci/.github/workflows/release.yml@v1
+    with:
+      app-id: 00000000-0000-4000-8000-000000000000   # your app's id, from the portal
+      environment: production
+      credential: token
+    secrets:
+      ROBUTLER_RELEASE_TOKEN: ${{ secrets.ROBUTLER_RELEASE_TOKEN }}

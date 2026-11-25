@@ -1,0 +1,160 @@
+# The Robutler app release workflow (reusable).
+#
+# An app's repository calls this when a release tag is pushed. It asks the Robutler portal to release the app from
+# that tag: the portal reads the tagged commit from GitHub itself, compares what the app is allowed to do with the
+# current release, and releases it. If the new version would let the app reach more, nothing is released and the
+# app's owner is asked to approve it in the portal.
+#
+# Two ways to prove who is releasing, chosen with `credential`:
+#   oidc   (default) GitHub's own identity token for this run. Nothing is stored in the repository. The portal accepts
+#          it only for the repository the app is linked to, for a release tag, and only when the run used THIS workflow
+#          at a released version tag (the caller's `uses:` line must end in `@v1`, not a branch or a commit).
+#   token  a release token made in the portal (Settings, Developer, Release tokens), stored as the repository secret
+#          ROBUTLER_RELEASE_TOKEN.
+#
+# The caller grants `id-token: write` (oidc only) and `contents: read`. This workflow checks out nothing and runs no
+# code from the calling repository.
+name: Release a Robutler app
+
+on:
+  workflow_call:
+    inputs:
+      app-id:
+        description: "The app's id in the portal (a system app: its type)."
+        required: true
+        type: string
+      environment:
+        description: 'Which portal to release to: dev, staging or production.'
+        required: true
+        type: string
+      credential:
+        description: 'oidc (the default, no secret) or token (the secret ROBUTLER_RELEASE_TOKEN).'
+        required: false
+        type: string
+        default: oidc
+    secrets:
+      ROBUTLER_RELEASE_TOKEN:
+        description: 'A release token from the portal. Needed only with credential: token.'
+        required: false
+    outputs:
+      outcome:
+        description: 'released, unchanged or approval_requested.'
+        value: ${{ jobs.oidc.outputs.outcome || jobs.token.outputs.outcome }}
+      approval-url:
+        description: 'Where the owner approves, when the outcome is approval_requested.'
+        value: ${{ jobs.oidc.outputs.approval-url || jobs.token.outputs.approval-url }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  oidc:
+    name: Release (GitHub identity token)
+    if: ${{ inputs.credential == 'oidc' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      outcome: ${{ steps.release.outputs.outcome }}
+      approval-url: ${{ steps.release.outputs.approval-url }}
+    steps:
+      - name: Release
+        id: release
+        shell: bash
+        env:
+          APP_ID: ${{ inputs.app-id }}
+          TARGET: ${{ inputs.environment }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            production) HOST="robutler.ai" ;;
+            staging)    HOST="staging.robutler.net" ;;
+            dev)        HOST="dev.robutler.net" ;;
+            *) echo "::error::environment must be dev, staging or production"; exit 2 ;;
+          esac
+          if [[ ! "$REF" =~ ^refs/tags/v[0-9][0-9a-z._-]*$ ]]; then
+            echo "::error::A release is a tag: v, a digit, then lower case letters, digits, '.', '_' or '-'. This run is for $REF."
+            exit 2
+          fi
+          if [[ ! "$APP_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::app-id is the app's id from the portal"; exit 2
+          fi
+          # One identity token per request, for this environment's audience only. It is never printed.
+          OIDC=$(curl -sS --fail-with-body -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=robutler-apps:$HOST" | jq -r '.value // empty')
+          if [[ -z "$OIDC" ]]; then
+            echo "::error::GitHub issued no identity token. The calling job needs 'permissions: id-token: write'."
+            exit 2
+          fi
+          echo "::add-mask::$OIDC"
+          STATUS=$(curl -sS -o response.json -w '%{http_code}' -X POST "https://$HOST/api/apps/$APP_ID/release/ci" \
+            -H "Authorization: Bearer $OIDC" -H 'Content-Type: application/json' \
+            --data "$(jq -cn --arg ref "${REF#refs/tags/}" --arg sha "$SHA" '{ref: $ref, sha: $sha}')")
+          OUTCOME=$(jq -r '.outcome // empty' response.json 2>/dev/null || true)
+          echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+          echo "approval-url=$(jq -r '.approvalUrl // empty' response.json 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          case "$STATUS" in
+            200) echo "Release: $OUTCOME ($(jq -r '.repo + "@" + .sha + " (" + .ref + ")"' response.json))" ;;
+            202) echo "::warning::Nothing was released. This version changes what the app is allowed to do, or would make it public, so its owner was asked to approve it: $(jq -r '.approvalUrl' response.json)"
+                 jq -r '.security.widened[]? | "  - " + .message' response.json ;;
+            *)   echo "::error::Release refused ($STATUS): $(jq -r '(.error.code // "unknown") + ": " + (.error.message // "no message")' response.json 2>/dev/null || echo 'no answer')"
+                 exit 1 ;;
+          esac
+
+  token:
+    name: Release (release token)
+    if: ${{ inputs.credential == 'token' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.release.outputs.outcome }}
+      approval-url: ${{ steps.release.outputs.approval-url }}
+    steps:
+      - name: Release
+        id: release
+        shell: bash
+        env:
+          APP_ID: ${{ inputs.app-id }}
+          TARGET: ${{ inputs.environment }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          ROBUTLER_RELEASE_TOKEN: ${{ secrets.ROBUTLER_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          case "$TARGET" in
+            production) HOST="robutler.ai" ;;
+            staging)    HOST="staging.robutler.net" ;;
+            dev)        HOST="dev.robutler.net" ;;
+            *) echo "::error::environment must be dev, staging or production"; exit 2 ;;
+          esac
+          if [[ ! "$REF" =~ ^refs/tags/v[0-9][0-9a-z._-]*$ ]]; then
+            echo "::error::A release is a tag: v, a digit, then lower case letters, digits, '.', '_' or '-'. This run is for $REF."
+            exit 2
+          fi
+          if [[ ! "$APP_ID" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]; then
+            echo "::error::app-id is the app's id from the portal"; exit 2
+          fi
+          if [[ -z "${ROBUTLER_RELEASE_TOKEN:-}" ]]; then
+            echo "::error::The secret ROBUTLER_RELEASE_TOKEN is not set. Make a release token in the portal (Settings, Developer) and pass it with 'secrets:'."
+            exit 2
+          fi
+          STATUS=$(curl -sS -o response.json -w '%{http_code}' -X POST "https://$HOST/api/apps/$APP_ID/release/ci" \
+            -H "Authorization: Bearer $ROBUTLER_RELEASE_TOKEN" -H 'Content-Type: application/json' \
+            --data "$(jq -cn --arg ref "${REF#refs/tags/}" --arg sha "$SHA" '{ref: $ref, sha: $sha}')")
+          OUTCOME=$(jq -r '.outcome // empty' response.json 2>/dev/null || true)
+          echo "outcome=$OUTCOME" >> "$GITHUB_OUTPUT"
+          echo "approval-url=$(jq -r '.approvalUrl // empty' response.json 2>/dev/null || true)" >> "$GITHUB_OUTPUT"
+          case "$STATUS" in
+            200) echo "Release: $OUTCOME ($(jq -r '.repo + "@" + .sha + " (" + .ref + ")"' response.json))" ;;
+            202) echo "::warning::Nothing was released. This version changes what the app is allowed to do, or would make it public, so its owner was asked to approve it: $(jq -r '.approvalUrl' response.json)"
+                 jq -r '.security.widened[]? | "  - " + .message' response.json ;;
+            *)   echo "::error::Release refused ($STATUS): $(jq -r '(.error.code // "unknown") + ": " + (.error.message // "no message")' response.json 2>/dev/null || echo 'no answer')"
+                 exit 1 ;;
+          esac

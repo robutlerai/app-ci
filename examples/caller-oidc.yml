@@ -1,0 +1,16 @@
+# Copy to .github/workflows/release.yml in your app's repository.
+# Releases the app when a version tag (v1, v1.2.0) is pushed. No secret is stored.
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    permissions:
+      id-token: write
+      contents: read
+    uses: robutlerai/app-ci/.github/workflows/release.yml@v1
+    with:
+      app-id: 00000000-0000-4000-8000-000000000000   # your app's id, from the portal
+      environment: production                          # dev, staging or production
